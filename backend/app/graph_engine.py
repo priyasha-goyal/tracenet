@@ -345,10 +345,10 @@ def detect_smurfing(graph, window_hours=6, min_transactions=8, threshold=10000, 
             
     return findings
 
-def detect_rapid_passthrough(graph, max_gap_minutes=15, min_forward_pct=0.7) -> list[dict]:
+def detect_rapid_passthrough(graph, max_gap_minutes=15, min_forward_pct=0.7, max_forward_pct=1.15) -> list[dict]:
     """
     Flags an account that receives a payment and forwards at least min_forward_pct of
-    that amount onward within max_gap_minutes.
+    that amount onward within max_gap_minutes, up to max_forward_pct (amount conservation).
     """
     findings = []
     
@@ -379,7 +379,8 @@ def detect_rapid_passthrough(graph, max_gap_minutes=15, min_forward_pct=0.7) -> 
                 
                 # Check timing: outgoing must happen AFTER incoming, within the gap
                 if t_in < t_out <= t_in + timedelta(minutes=max_gap_minutes):
-                    if amt_out >= amt_in * min_forward_pct:
+                    # Amount conservation check: min_forward_pct <= ratio <= max_forward_pct
+                    if amt_in * min_forward_pct <= amt_out <= amt_in * max_forward_pct:
                         dedup_key = (u, in_tx['transaction_id'], out_tx['transaction_id'])
                         if dedup_key in seen_passthrough:
                             continue
@@ -395,7 +396,7 @@ def detect_rapid_passthrough(graph, max_gap_minutes=15, min_forward_pct=0.7) -> 
                             "involved_transactions": [in_tx['transaction_id'], out_tx['transaction_id']],
                             "window_start": t_in.isoformat(),
                             "window_end": t_out.isoformat(),
-                            "evidence_summary": f"Received INR {amt_in:.2f} from upstream and forwarded INR {amt_out:.2f} ({forward_pct:.1f}%) onward within {gap_seconds} seconds — {min_forward_pct*100:.0f}%+ pass-through."
+                            "evidence_summary": f"Received INR {amt_in:.2f} from upstream and forwarded INR {amt_out:.2f} ({forward_pct:.1f}%) onward within {gap_seconds} seconds — amount conserved ({min_forward_pct*100:.0f}%-{max_forward_pct*100:.0f}%)."
                         })
                         
     return findings
