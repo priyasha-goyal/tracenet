@@ -271,6 +271,30 @@ add_transaction(
     cluster_id="C_PASSTHROUGH_1"
 )
 
+# ---------------------------------------------------------
+# 6. Legitimate Merchant Flash-Sale Burst: C_LEGIT_BURST_1
+# A normal flash sale: 10 personal accounts buy from the SAME merchant within
+# a 90-minute window, amounts ₹500–3000 each (normal purchase range).
+# is_injected=False — this is NOT fraud. It is structurally similar to fan-in
+# (many senders, one receiver, tight window) to stress-test false-positive rates.
+# ---------------------------------------------------------
+legit_merchant = merchants[0]  # deterministic: first merchant in the list
+legit_buyers = random.sample(personals, 10)  # 10 distinct personal accounts
+lb_start_time = datetime(2026, 8, 12, 12, 0, 0)  # midday flash sale
+
+for buyer in legit_buyers:
+    tx_time = lb_start_time + timedelta(seconds=random.randint(0, 5400))  # within 90 min
+    amount = random.randint(500, 3000)
+    add_transaction(
+        sender_id=buyer["account_id"],
+        receiver_id=legit_merchant["account_id"],
+        amount=amount,
+        timestamp=tx_time,
+        is_injected=False,
+        pattern_type="legit_burst",
+        cluster_id="C_LEGIT_BURST_1"
+    )
+
 # Sort all transactions by timestamp to keep the ledger chronological
 transactions.sort(key=lambda x: x["timestamp"])
 
@@ -335,8 +359,10 @@ print(f"Total Accounts Generated: {total_accounts}")
 for t, count in acc_types.items():
     print(f"  - {t.capitalize()}: {count}")
 
+legit_burst_count = sum(1 for tx in transactions if tx["cluster_id"] == "C_LEGIT_BURST_1")
 print(f"\nTotal Transactions Generated: {total_tx}")
-print(f"  - Normal Background Transactions: {normal_tx_count}")
+print(f"  - Normal Background Transactions: {normal_tx_count - legit_burst_count}")
+print(f"  - Legit Burst (C_LEGIT_BURST_1, not fraud): {legit_burst_count}")
 print(f"  - Injected Fraud Transactions: {injected_tx_count}")
 
 print("\nInjected Fraud Patterns Breakdown:")
@@ -344,6 +370,8 @@ for pt, clusters in injected_by_pattern.items():
     print(f"  - Pattern: '{pt}'")
     for cid, count in clusters.items():
         print(f"    * Cluster ID: {cid} ({count} transactions)")
+print("\nLegit Burst Breakdown (NOT fraud — false-positive stress test):")
+print(f"  - Cluster: C_LEGIT_BURST_1 ({legit_burst_count} transactions, merchant: {legit_merchant['upi_id']})")
 print("=" * 60)
 print(f"Accounts saved to: {ACCOUNTS_CSV}")
 print(f"Transactions saved to: {TRANSACTIONS_CSV}")
