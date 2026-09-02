@@ -11,6 +11,7 @@ import networkx as nx
 from sqlalchemy.orm import Session
 
 # Local imports
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from database import engine, Base, get_db, SessionLocal
 from models import Case, PayerEvent
 from graph_engine import (
