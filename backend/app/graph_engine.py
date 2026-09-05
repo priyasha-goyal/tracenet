@@ -400,3 +400,173 @@ def detect_rapid_passthrough(graph, max_gap_minutes=15, min_forward_pct=0.7, max
                         })
                         
     return findings
+
+
+# ---------------------------------------------------------
+# Incremental helpers (live simulate) — do not change detectors above
+# ---------------------------------------------------------
+
+def add_transaction_to_graph(graph, sender_id, receiver_id, amount, timestamp, transaction_id):
+    """
+    Adds a single transaction edge to an existing MultiDiGraph using the same
+    attribute shape as load_graph(). Creates missing nodes if needed.
+    """
+    if sender_id not in graph:
+        graph.add_node(sender_id)
+    if receiver_id not in graph:
+        graph.add_node(receiver_id)
+
+    if not isinstance(timestamp, datetime):
+        if hasattr(timestamp, "to_pydatetime"):
+            timestamp = timestamp.to_pydatetime()
+        else:
+            timestamp = datetime.fromisoformat(str(timestamp))
+
+    graph.add_edge(
+        sender_id,
+        receiver_id,
+        amount=float(amount),
+        timestamp=timestamp,
+        transaction_id=transaction_id,
+        is_injected=False,
+        pattern_type="",
+        cluster_id="",
+    )
+    return graph
+
+
+def _copy_node_into(sub, graph, node_id):
+    if node_id in sub:
+        return
+    if node_id in graph:
+        sub.add_node(node_id, **dict(graph.nodes[node_id]))
+    else:
+        sub.add_node(node_id)
+
+
+def _incident_subgraph(graph, account_id):
+    """Subgraph of edges into/out of account_id (plus those endpoint nodes)."""
+    sub = nx.MultiDiGraph()
+    if account_id not in graph:
+        return sub
+
+    _copy_node_into(sub, graph, account_id)
+
+    for u, v, _, data in graph.in_edges(account_id, keys=True, data=True):
+        _copy_node_into(sub, graph, u)
+        sub.add_edge(u, v, **dict(data))
+
+    for u, v, _, data in graph.out_edges(account_id, keys=True, data=True):
+        _copy_node_into(sub, graph, v)
+        sub.add_edge(u, v, **dict(data))
+
+    return sub
+
+
+def _detect_circular_flow_from_account(graph, account_id, max_hop_gap_minutes=30, max_chain_length=6):
+    """
+    Same algorithm as detect_circular_flow, but DFS is seeded only from edges
+    that touch account_id. Traversal still uses the full graph adjacency.
+    """
+    findings = []
+    detected_cycles_keys = set()
+
+    adj = {node: [] for node in graph.nodes()}
+    for u, v, data in graph.edges(data=True):
+        adj[u].append((v, data))
+
+    for u in adj:
+        adj[u].sort(key=lambda x: x[1]["timestamp"])
+
+    def dfs(current_node, start_node, path_edges, last_time):
+        if current_node == start_node and len(path_edges) >= 3:
+            tx_ids = sorted([e["transaction_id"] for e in path_edges])
+            cycle_key = tuple(tx_ids)
+            if cycle_key not in detected_cycles_keys:
+                detected_cycles_keys.add(cycle_key)
+
+                all_nodes = [path_edges[0]["sender_id"]] + [e["receiver_id"] for e in path_edges]
+                involved_accounts = list(dict.fromkeys(all_nodes))
+
+                chain_upis = [graph.nodes[n].get("upi_id", n[:8]) for n in involved_accounts]
+                chain_str = " -> ".join(chain_upis)
+                amount_sample = path_edges[0]["amount"]
+
+                total_duration_mins = int(
+                    (path_edges[-1]["timestamp"] - path_edges[0]["timestamp"]).total_seconds() / 60
+                )
+
+                findings.append({
+                    "pattern_type": "circular",
+                    "primary_account": start_node,
+                    "involved_accounts": involved_accounts[:-1],
+                    "involved_transactions": [e["transaction_id"] for e in path_edges],
+                    "window_start": path_edges[0]["timestamp"].isoformat(),
+                    "window_end": path_edges[-1]["timestamp"].isoformat(),
+                    "evidence_summary": (
+                        f"{len(path_edges)}-hop circular flow: {chain_str} — "
+                        f"INR {amount_sample:.0f} cycled back to origin in {total_duration_mins} minutes."
+                    )
+                })
+            return
+
+        if len(path_edges) >= max_chain_length:
+            return
+
+        t_limit = last_time + timedelta(minutes=max_hop_gap_minutes)
+        for next_node, data in adj[current_node]:
+            tx_time = data["timestamp"]
+
+            if last_time <= tx_time <= t_limit:
+                visited_nodes = {e["sender_id"] for e in path_edges}
+                if next_node == start_node or next_node not in visited_nodes:
+                    dfs(next_node, start_node, path_edges + [{
+                        "sender_id": current_node,
+                        "receiver_id": next_node,
+                        "amount": data["amount"],
+                        "timestamp": data["timestamp"],
+                        "transaction_id": data["transaction_id"]
+                    }], tx_time)
+            elif tx_time > t_limit:
+                break
+
+    if account_id not in graph:
+        return findings
+
+    start_edges = list(graph.in_edges(account_id, data=True)) + list(graph.out_edges(account_id, data=True))
+    for u, v, data in start_edges:
+        start_time = data["timestamp"]
+        first_hop = {
+            "sender_id": u,
+            "receiver_id": v,
+            "amount": data["amount"],
+            "timestamp": start_time,
+            "transaction_id": data["transaction_id"]
+        }
+        dfs(v, u, [first_hop], start_time)
+
+    return findings
+
+
+def rescan_account(graph, account_id) -> list[dict]:
+    """
+    Re-run pattern detectors scoped to one account (as sender or receiver)
+    instead of scanning every node in the graph.
+    """
+    if account_id not in graph:
+        return []
+
+    scoped = _incident_subgraph(graph, account_id)
+    raw = []
+    raw.extend(detect_fan_out(scoped))
+    raw.extend(detect_fan_in(scoped))
+    raw.extend(detect_smurfing(scoped))
+    raw.extend(detect_rapid_passthrough(scoped))
+    raw.extend(_detect_circular_flow_from_account(graph, account_id))
+
+    scoped_findings = []
+    for f in raw:
+        involved = set(f.get("involved_accounts", [])) | {f.get("primary_account")}
+        if account_id in involved:
+            scoped_findings.append(f)
+    return scoped_findings

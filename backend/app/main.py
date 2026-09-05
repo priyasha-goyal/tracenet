@@ -21,6 +21,8 @@ from graph_engine import (
     detect_circular_flow,
     detect_smurfing,
     detect_rapid_passthrough,
+    add_transaction_to_graph,
+    rescan_account,
 )
 from risk_engine import compute_risk_scores, get_risk_bucket
 
@@ -33,6 +35,92 @@ GLOBAL_GRAPH: nx.MultiDiGraph = nx.MultiDiGraph()
 UPI_TO_UUID: dict = {}
 FINDINGS_BY_ACCOUNT: dict = {}
 SCORED_FINDINGS: list = []
+
+
+def _finding_tx_key(finding: dict) -> tuple:
+    return (
+        finding.get("pattern_type"),
+        tuple(sorted(finding.get("involved_transactions", []))),
+    )
+
+
+def _dedup_passthrough_inside_circular(raw_findings: list, extra_circular: list = None) -> list:
+    circular_findings = [f for f in raw_findings if f["pattern_type"] == "circular"]
+    if extra_circular:
+        circular_findings.extend(extra_circular)
+    circular_account_sets = [
+        set(f["involved_accounts"]) | {f["primary_account"]} for f in circular_findings
+    ]
+
+    filtered_raw = []
+    for f in raw_findings:
+        if f["pattern_type"] == "pass_through":
+            pt_nodes = set(f["involved_accounts"]) | {f["primary_account"]}
+            if any(pt_nodes.issubset(c_set) for c_set in circular_account_sets):
+                continue
+        filtered_raw.append(f)
+    return filtered_raw
+
+
+def _cluster_id_for_finding(finding: dict):
+    cid = finding.get("cluster_id")
+    if cid:
+        return cid
+    tx_set = set(finding.get("involved_transactions", []))
+    for u, v, k, d in GLOBAL_GRAPH.edges(keys=True, data=True):
+        if d.get("transaction_id") in tx_set and d.get("cluster_id"):
+            return d["cluster_id"]
+    return cid
+
+
+def _index_scored_finding(sf: dict):
+    f = sf["finding"]
+    involved = set(f.get("involved_accounts", [])) | {f["primary_account"]}
+    for acc in involved:
+        if acc not in FINDINGS_BY_ACCOUNT:
+            FINDINGS_BY_ACCOUNT[acc] = []
+        FINDINGS_BY_ACCOUNT[acc].append(sf)
+        FINDINGS_BY_ACCOUNT[acc].sort(key=lambda x: x["final_score"], reverse=True)
+
+
+def _create_case_if_needed(db: Session, sf: dict) -> bool:
+    bucket = sf["risk_bucket"]
+    if bucket not in ["High", "Critical"]:
+        return False
+
+    f = sf["finding"]
+    acc_id = f["primary_account"]
+    ptype = f["pattern_type"]
+    cid = _cluster_id_for_finding(f)
+
+    existing = db.query(Case).filter(
+        Case.account_id == acc_id,
+        Case.pattern_type == ptype
+    ).first()
+
+    if existing:
+        return False
+
+    db.add(Case(
+        account_id=acc_id,
+        pattern_type=ptype,
+        cluster_id=cid,
+        risk_score=sf["final_score"],
+        risk_bucket=bucket,
+        evidence_summary=f["evidence_summary"],
+        status="open"
+    ))
+    return True
+
+
+def _sync_upi_mapping(account_id: str):
+    """Keep UPI_TO_UUID in sync if a node (possibly new) has a upi_id."""
+    if account_id not in GLOBAL_GRAPH.nodes:
+        return
+    upi = GLOBAL_GRAPH.nodes[account_id].get("upi_id")
+    if upi:
+        UPI_TO_UUID[upi] = account_id
+
 
 def initialize_app_data():
     global GLOBAL_GRAPH, UPI_TO_UUID, FINDINGS_BY_ACCOUNT, SCORED_FINDINGS
@@ -59,17 +147,7 @@ def initialize_app_data():
     all_raw.extend(detect_smurfing(GLOBAL_GRAPH))
     all_raw.extend(detect_rapid_passthrough(GLOBAL_GRAPH))
 
-    # Dedup pass_through findings contained in circular flow
-    circular_findings = [f for f in all_raw if f["pattern_type"] == "circular"]
-    circular_account_sets = [set(f["involved_accounts"]) | {f["primary_account"]} for f in circular_findings]
-
-    filtered_raw = []
-    for f in all_raw:
-        if f["pattern_type"] == "pass_through":
-            pt_nodes = set(f["involved_accounts"]) | {f["primary_account"]}
-            if any(pt_nodes.issubset(c_set) for c_set in circular_account_sets):
-                continue
-        filtered_raw.append(f)
+    filtered_raw = _dedup_passthrough_inside_circular(all_raw)
 
     # 4. Compute risk scores
     SCORED_FINDINGS = compute_risk_scores(GLOBAL_GRAPH, filtered_raw)
@@ -95,37 +173,8 @@ def initialize_app_data():
     try:
         cases_created = 0
         for sf in SCORED_FINDINGS:
-            bucket = sf["risk_bucket"]
-            if bucket in ["High", "Critical"]:
-                f = sf["finding"]
-                acc_id = f["primary_account"]
-                ptype = f["pattern_type"]
-
-                cid = f.get("cluster_id")
-                if not cid:
-                    tx_set = set(f.get("involved_transactions", []))
-                    for u, v, k, d in GLOBAL_GRAPH.edges(keys=True, data=True):
-                        if d.get("transaction_id") in tx_set and d.get("cluster_id"):
-                            cid = d["cluster_id"]
-                            break
-
-                existing = db.query(Case).filter(
-                    Case.account_id == acc_id,
-                    Case.pattern_type == ptype
-                ).first()
-
-                if not existing:
-                    new_case = Case(
-                        account_id=acc_id,
-                        pattern_type=ptype,
-                        cluster_id=cid,
-                        risk_score=sf["final_score"],
-                        risk_bucket=bucket,
-                        evidence_summary=f["evidence_summary"],
-                        status="open"
-                    )
-                    db.add(new_case)
-                    cases_created += 1
+            if _create_case_if_needed(db, sf):
+                cases_created += 1
 
         db.commit()
         print(f"[STARTUP] Auto-created {cases_created} new Case records in database.")
@@ -236,10 +285,66 @@ def get_account_risk(account_id: str):
 
 @app.post("/transactions/simulate")
 def simulate_transaction(req: SimulateTransactionRequest, db: Session = Depends(get_db)):
+    global SCORED_FINDINGS
+
     payer_id = resolve_account_id(req.payer_account_id)
     payee_id = resolve_account_id(req.payee_account_id)
 
-    # Look up payee risk
+    # Log PayerEvent first so we have a stable transaction_id
+    event = PayerEvent(
+        payer_account_id=payer_id,
+        payee_account_id=payee_id,
+        amount=req.amount,
+        risk_score_at_time=0.0,
+        risk_bucket_at_time="Low",
+        user_action=None
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+
+    tx_id = f"sim-{event.id}"
+    add_transaction_to_graph(
+        GLOBAL_GRAPH,
+        payer_id,
+        payee_id,
+        req.amount,
+        event.timestamp,
+        tx_id,
+    )
+    _sync_upi_mapping(payer_id)
+    _sync_upi_mapping(payee_id)
+
+    raw_new = rescan_account(GLOBAL_GRAPH, payee_id)
+    if payer_id != payee_id:
+        raw_new.extend(rescan_account(GLOBAL_GRAPH, payer_id))
+
+    seen_raw_keys = set()
+    unique_raw = []
+    for f in raw_new:
+        k = _finding_tx_key(f)
+        if k in seen_raw_keys:
+            continue
+        seen_raw_keys.add(k)
+        unique_raw.append(f)
+
+    extra_circular = [
+        sf["finding"] for sf in SCORED_FINDINGS if sf["finding"]["pattern_type"] == "circular"
+    ]
+    filtered_raw = _dedup_passthrough_inside_circular(unique_raw, extra_circular=extra_circular)
+
+    existing_keys = {_finding_tx_key(sf["finding"]) for sf in SCORED_FINDINGS}
+    novel_raw = [f for f in filtered_raw if _finding_tx_key(f) not in existing_keys]
+
+    new_scored = compute_risk_scores(GLOBAL_GRAPH, novel_raw) if novel_raw else []
+    for sf in new_scored:
+        SCORED_FINDINGS.append(sf)
+        _index_scored_finding(sf)
+        _create_case_if_needed(db, sf)
+    if new_scored:
+        db.commit()
+
+    # Look up payee risk from live-updated findings
     if payee_id in FINDINGS_BY_ACCOUNT and FINDINGS_BY_ACCOUNT[payee_id]:
         tf = FINDINGS_BY_ACCOUNT[payee_id][0]
         payee_score = tf["final_score"]
@@ -250,18 +355,9 @@ def simulate_transaction(req: SimulateTransactionRequest, db: Session = Depends(
         payee_bucket = "Low"
         payee_evidence = "No suspicious activity detected for payee."
 
-    # Log PayerEvent in SQLite DB
-    event = PayerEvent(
-        payer_account_id=payer_id,
-        payee_account_id=payee_id,
-        amount=req.amount,
-        risk_score_at_time=payee_score,
-        risk_bucket_at_time=payee_bucket,
-        user_action=None
-    )
-    db.add(event)
+    event.risk_score_at_time = payee_score
+    event.risk_bucket_at_time = payee_bucket
     db.commit()
-    db.refresh(event)
 
     # Intercept decision logic
     if payee_bucket in ["High", "Critical"]:

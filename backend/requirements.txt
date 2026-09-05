@@ -6,3 +6,6 @@ sqlalchemy
 faker
 python-multipart
 websockets
+pytest
+httpx
+
