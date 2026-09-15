@@ -1,6 +1,8 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, Text, DateTime
-from database import Base
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text
+
+from app.db.session import Base
+
 
 class Case(Base):
     __tablename__ = "cases"
@@ -27,6 +29,7 @@ class Case(Base):
             "status": self.status,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
 
 class PayerEvent(Base):
     __tablename__ = "payer_events"

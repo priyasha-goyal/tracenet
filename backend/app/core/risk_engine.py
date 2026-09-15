@@ -1,6 +1,7 @@
 from datetime import datetime
 import networkx as nx
 
+
 def compute_sub_signals(graph: nx.MultiDiGraph, finding: dict) -> dict:
     """
     Computes four sub-signals (each in 0..1, except receiver_dampening which is -1..0)
@@ -104,8 +105,9 @@ def compute_sub_signals(graph: nx.MultiDiGraph, finding: dict) -> dict:
         "structural_strength": structural_strength,
         "sender_freshness": sender_freshness,
         "amount_band_signal": amount_band_signal,
-        "receiver_dampening": receiver_dampening
+        "receiver_dampening": receiver_dampening,
     }
+
 
 def get_risk_bucket(score: float) -> str:
     if score <= 30.0:
@@ -116,6 +118,7 @@ def get_risk_bucket(score: float) -> str:
         return "High"
     else:
         return "Critical"
+
 
 def compute_risk_scores(graph: nx.MultiDiGraph, findings: list[dict] = None) -> list[dict]:
     """
@@ -130,23 +133,23 @@ def compute_risk_scores(graph: nx.MultiDiGraph, findings: list[dict] = None) -> 
     scored_findings = []
     for f in findings:
         sub = compute_sub_signals(graph, f)
-        
+
         # Weighted combination equation
         raw_score = (
-            (sub["structural_strength"] * 40) +
-            (sub["sender_freshness"] * 30) +
-            (sub["amount_band_signal"] * 20) +
-            (sub["receiver_dampening"] * 25)
+            (sub["structural_strength"] * 40)
+            + (sub["sender_freshness"] * 30)
+            + (sub["amount_band_signal"] * 20)
+            + (sub["receiver_dampening"] * 25)
         )
-        
+
         final_score = round(max(0.0, min(100.0, raw_score)), 1)
         bucket = get_risk_bucket(final_score)
-        
+
         scored_findings.append({
             "finding": f,
             "sub_signals": sub,
             "final_score": final_score,
-            "risk_bucket": bucket
+            "risk_bucket": bucket,
         })
 
     return scored_findings

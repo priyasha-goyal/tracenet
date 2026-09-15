@@ -1,14 +1,20 @@
 import os
+import sys
 import pandas as pd
-from graph_engine import (
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from app.core.graph_engine import (
     load_graph,
     detect_fan_out,
     detect_fan_in,
     detect_circular_flow,
     detect_smurfing,
-    detect_rapid_passthrough
+    detect_rapid_passthrough,
 )
-from risk_engine import compute_risk_scores
+from app.core.risk_engine import compute_risk_scores
 
 # Paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

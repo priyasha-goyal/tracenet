@@ -4,13 +4,11 @@ import sys
 import pandas as pd
 from fastapi.testclient import TestClient
 
-APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if APP_DIR not in sys.path:
-    sys.path.insert(0, APP_DIR)
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
 
-from main import app  # noqa: E402
-
-BACKEND_DIR = os.path.dirname(APP_DIR)
+from app.main import app  # noqa: E402
 TRANSACTIONS_CSV = os.path.join(BACKEND_DIR, "data_generator", "output", "transactions.csv")
 
 FRAUD_CLUSTERS = [
